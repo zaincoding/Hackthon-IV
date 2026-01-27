@@ -1,0 +1,1527 @@
+"""
+AI Service for processing natural language commands and interacting with MCP tools.
+This service acts as an intermediary between the user's natural language input
+and the MCP tools that perform todo operations.
+"""
+
+import re
+import json
+from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
+from openai import OpenAI
+from openai.types.beta.assistant import Assistant
+from ..config.settings import settings
+from ..tools.mcp_server import mcp_server
+from ..utils.logger import logger
+from ..models.context import ConversationContext, ContextType, context_manager
+
+
+class AIService:
+    """
+    Service for processing natural language commands and coordinating with MCP tools.
+    """
+
+    def __init__(self):
+        self.openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        self.model = settings.OPENAI_MODEL
+
+        # Initialize OpenAI Assistant with proper instructions and tools
+        self.assistant = self._initialize_assistant()
+
+        # Define regex patterns as fallback for basic NLP
+        self.patterns = {
+            'number_selection': [
+                r'^(\d+)\.$',  # Matches just a number followed by a dot (e.g., "2.")
+                r'^(\d+)$',    # Matches just a number (e.g., "2")
+                r'^select\s+(\d+)$',  # Matches "select 2"
+                r'^option\s+(\d+)$',  # Matches "option 2"
+            ],
+            'edit_todo': [
+                r'[Ee]dit\s+(?:the\s+)?(.+)',  # Case-insensitive for "edit"
+                r'[Uu]pdate\s+(?:the\s+)?(.+)',  # Case-insensitive for "update"
+                r'[Cc]hange\s+(?:the\s+)?(.+)',  # Case-insensitive for "change"
+                r'[Mm]odify\s+(?:the\s+)?(.+)',  # Case-insensitive for "modify"
+            ],
+            'delete_todo': [
+                r'(?:[Dd]elete|[Rr]emove|[Ee]rase)\s+(?:task|todo|#)?\s*(\d+|\w+)',
+                r'[Dd]elete\s+(?:the\s+)?(.+?)(?:\s+todo|task)',
+                r'(?:[Dd]elete|[Rr]emove|[Ee]rase)\s+(?:the\s+)?(.+)',  # More flexible pattern for "delete [full title]"
+            ],
+            'complete_todo': [
+                r'(?:[Cc]omplete|[Ff]inish|[Dd]one|mark.*?as\s+done|[Cc]heck)\s+(?:task|todo|#)?\s*(\d+|\w+)',
+                r'[Cc]omplete\s+(?:the\s+)?(.+?)(?:\s+todo|task)',
+                r'(?:[Cc]omplete|[Ff]inish|[Dd]one|mark.*?as\s+done|[Cc]heck)\s+(?:the\s+)?(.+)',  # More flexible pattern for "complete [full title]"
+            ],
+            'view_todos': [
+                r'(?:show|display|list|view)\s+(?:me\s+)?(?:my\s+)?(.+?)(?:\s+todos?)?$',
+                r'what(?:\'s|s)\s+(?:my\s+)?(.+?)(?:\s+todos?)',
+                r'do\s+i\s+have\s+(?:any\s+)?(.+)',
+            ],
+            'add_todo': [
+                r'add\s+(.+?)(?:\s+to\s+my\s+)?(?:todos?|tasks?)',
+                r'create\s+(.+?)(?:\s+to\s+my\s+)?(?:todos?|tasks?)',
+                r'new\s+(.+?)(?:\s+to\s+my\s+)?(?:todos?|tasks?)',
+                r'add\s+(.+)',  # More flexible pattern for just "add [something]"
+                r'i\s+need\s+to\s+(.+)',  # Pattern for "I need to [do something]"
+                r'i\s+will\s+(.+)',  # Pattern for "I will [do something]"
+                r'i\s+want\s+to\s+(.+)',  # Pattern for "I want to [do something]"
+                r'(\w+\s+and\s+.+)',  # Pattern for "[action] and [more details]"
+            ],
+        }
+
+    def _initialize_assistant(self) -> Assistant:
+        """
+        Initialize the OpenAI Assistant with proper instructions and tools.
+        """
+        try:
+            # Create or retrieve the assistant with MCP tools attached
+            assistant = self.openai_client.beta.assistants.create(
+                name="Todo Management Assistant",
+                description="An AI assistant specialized in managing todos through natural language commands.",
+                model=self.model,
+                instructions="""
+                You are a helpful AI assistant specialized in managing todos.
+                You can help users add, view, edit, delete, and complete todos using natural language.
+
+                Use the provided tools to perform todo operations:
+                - add_todo: Add a new todo with title, description, due date, priority, and category
+                - list_todos: List todos with optional filters for status, category, and limit
+                - edit_todo: Edit an existing todo's properties
+                - delete_todo: Delete a specific todo
+                - complete_todo: Mark a todo as completed
+
+                When users give commands like "add buy groceries", "show my pending todos",
+                "complete task 1", or "delete meeting", use the appropriate tools to fulfill their requests.
+
+                Always provide helpful and friendly responses to users.
+                """,
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "add_todo",
+                            "description": "Add a new todo to a session",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "session_id": {"type": "string", "description": "The session ID"},
+                                    "title": {"type": "string", "description": "The todo title"},
+                                    "description": {"type": "string", "description": "Optional description"},
+                                    "due_date": {"type": "string", "description": "Optional due date in ISO format"},
+                                    "priority": {"type": "string", "enum": ["low", "medium", "high"], "description": "Priority level"},
+                                    "category": {"type": "string", "description": "Optional category"}
+                                },
+                                "required": ["session_id", "title"]
+                            }
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "list_todos",
+                            "description": "List todos in a session with optional filtering",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "session_id": {"type": "string", "description": "The session ID"},
+                                    "status": {"type": "string", "enum": ["pending", "in-progress", "completed", "cancelled"], "description": "Optional status filter"},
+                                    "category": {"type": "string", "description": "Optional category filter"},
+                                    "limit": {"type": "integer", "description": "Optional limit on number of results"}
+                                },
+                                "required": ["session_id"]
+                            }
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "edit_todo",
+                            "description": "Edit an existing todo",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "session_id": {"type": "string", "description": "The session ID"},
+                                    "todo_id": {"type": "string", "description": "The ID of the todo to edit"},
+                                    "title": {"type": "string", "description": "New title (optional)"},
+                                    "description": {"type": "string", "description": "New description (optional)"},
+                                    "due_date": {"type": "string", "description": "New due date (optional)"},
+                                    "priority": {"type": "string", "enum": ["low", "medium", "high"], "description": "New priority (optional)"},
+                                    "category": {"type": "string", "description": "New category (optional)"},
+                                    "status": {"type": "string", "enum": ["pending", "in-progress", "completed", "cancelled"], "description": "New status (optional)"}
+                                },
+                                "required": ["session_id", "todo_id"]
+                            }
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "delete_todo",
+                            "description": "Delete a todo from a session",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "session_id": {"type": "string", "description": "The session ID"},
+                                    "todo_id": {"type": "string", "description": "The ID of the todo to delete"}
+                                },
+                                "required": ["session_id", "todo_id"]
+                            }
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "complete_todo",
+                            "description": "Mark a todo as completed",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "session_id": {"type": "string", "description": "The session ID"},
+                                    "todo_id": {"type": "string", "description": "The ID of the todo to complete"}
+                                },
+                                "required": ["session_id", "todo_id"]
+                            }
+                        }
+                    }
+                ]
+            )
+            return assistant
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI Assistant: {str(e)}")
+            # Fallback to basic NLP if assistant initialization fails
+            return None
+
+    def _extract_intent_and_entities(self, user_input: str) -> Tuple[str, Dict[str, Any]]:
+        """
+        Extract the intent and entities from the user's natural language input.
+
+        Args:
+            user_input: The raw user input string
+
+        Returns:
+            A tuple containing the intent and extracted entities
+        """
+        user_input_lower = user_input.lower().strip()
+
+        # Check for different intents based on patterns
+        for intent, patterns in self.patterns.items():
+            for pattern in patterns:
+                match = re.search(pattern, user_input_lower)
+                if match:
+                    # Extract relevant information based on intent
+                    entities = {}
+
+                    if intent == 'add_todo':
+                        # Extract todo title and potential due date/priority
+                        title_match = match.group(1)
+                        entities['title'] = title_match.strip()
+
+                        # Look for potential due dates in the input
+                        date_patterns = [
+                            r'tomorrow',
+                            r'next\s+week',
+                            r'by\s+(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)',
+                            r'on\s+(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)'
+                        ]
+                        for date_pattern in date_patterns:
+                            date_match = re.search(date_pattern, user_input_lower)
+                            if date_match:
+                                # Convert natural language dates to ISO format
+                                entities['due_date'] = self._convert_to_iso_date(date_match.group(0))
+                                break
+
+                        # Look for priority indicators
+                        if 'urgent' in user_input_lower or 'important' in user_input_lower or 'high' in user_input_lower:
+                            entities['priority'] = 'high'
+                        elif 'low' in user_input_lower or r'not\s+important' in user_input_lower:
+                            entities['priority'] = 'low'
+
+                    elif intent == 'view_todos':
+                        # Determine what kind of todos to show
+                        filter_text = match.group(1) if len(match.groups()) > 0 else ''
+                        if 'completed' in filter_text:
+                            entities['status'] = 'completed'
+                        elif 'pending' in filter_text or 'incomplete' in filter_text:
+                            entities['status'] = 'pending'
+                        elif 'today' in filter_text:
+                            entities['due_date'] = 'today'
+                        elif 'work' in filter_text:
+                            entities['category'] = 'work'
+                        elif 'personal' in filter_text:
+                            entities['category'] = 'personal'
+
+                    elif intent in ['complete_todo', 'delete_todo']:
+                        # Extract todo identifier (could be number or title)
+                        try:
+                            identifier = match.group(1)
+                            if identifier.isdigit():
+                                entities['todo_id'] = identifier
+                            else:
+                                entities['title_keyword'] = identifier.strip()
+                        except IndexError:
+                            # Fallback: try group(2) if available or use the full match
+                            entities['title_keyword'] = user_input_lower.split()[1:]  # Skip the command word
+                            entities['title_keyword'] = ' '.join(entities['title_keyword']).strip()
+
+                    elif intent == 'number_selection':
+                        # Extract the number from the selection
+                        try:
+                            number_str = match.group(1)
+                            entities['number'] = number_str
+                        except IndexError:
+                            # Fallback to extract any number from the input
+                            import re as regex_module
+                            numbers = regex_module.findall(r'\d+', user_input_lower)
+                            if numbers:
+                                entities['number'] = numbers[0]
+
+                    elif intent == 'edit_todo':
+                        # Extract what needs to be edited
+                        try:
+                            edit_text = match.group(1)
+                            entities['edit_details'] = edit_text
+                        except IndexError:
+                            entities['edit_details'] = ' '.join(user_input_lower.split()[1:]).strip()  # Skip the command word
+
+                    return intent, entities
+
+        # If no pattern matches, also try to find command words anywhere in the text for edit commands
+        # This handles cases where users add extra text before the actual command
+        edit_anywhere_match = re.search(r'.*\b([Ee]dit|[Uu]pdate|[Cc]hange|[Mm]odify)\b\s+(.+)', user_input_lower)
+        if edit_anywhere_match:
+            # Extract the command part after the edit-like word
+            command_part = edit_anywhere_match.group(2)
+
+            # Create a temporary match object to simulate original pattern matching
+            # We'll treat the extracted command part as if it started with the edit command
+            temp_full_command = f"{edit_anywhere_match.group(1)} {command_part}"
+
+            # Try to match against the edit patterns
+            for pattern in self.patterns['edit_todo']:
+                temp_match = re.search(pattern, temp_full_command.lower())
+                if temp_match:
+                    entities = {}
+                    try:
+                        edit_text = temp_match.group(1)
+                        entities['edit_details'] = edit_text
+                    except IndexError:
+                        entities['edit_details'] = ' '.join(temp_full_command.lower().split()[1:]).strip()
+
+                    return 'edit_todo', entities
+
+        # If no pattern matches, classify as unknown
+        return 'unknown', {'original_input': user_input}
+
+    def _convert_to_iso_date(self, natural_date: str) -> Optional[str]:
+        """
+        Convert natural language dates to ISO format.
+        This is a simplified implementation - in a real app, you'd want a more robust solution.
+        """
+        # This would be a more complete implementation in a real system
+        # For now, returning None to indicate that date conversion is not fully implemented
+        return None
+
+    async def process_user_input(self, user_input: str, session_id: str) -> Dict[str, Any]:
+        """
+        Process user input and coordinate with MCP tools to perform the requested action.
+
+        Args:
+            user_input: The user's natural language input
+            session_id: The current session ID
+
+        Returns:
+            A dictionary containing the AI's response and any suggested actions
+        """
+        try:
+            logger.info(f"Processing user input: {user_input}", extra={"session_id": session_id})
+
+            # Use OpenAI Assistant if available, otherwise fall back to regex-based NLP
+            if self.assistant:
+                response = await self._process_with_openai_assistant(user_input, session_id)
+            else:
+                # Fall back to the original regex-based approach
+                response = await self._process_with_fallback_nlp(user_input, session_id)
+
+            logger.info(f"AI response generated", extra={"session_id": session_id, "intent": response.get("intent", "unknown")})
+            return response
+
+            elif intent == 'view_todos':
+                # Call the list_todos MCP tool
+                try:
+                    result = await mcp_server.handle_request({
+                        "tool_name": "list_todos",
+                        "arguments": {
+                            "session_id": session_id,
+                            "status": entities.get('status'),
+                            "category": entities.get('category'),
+                            "limit": 10  # Limit to 10 for readability
+                        }
+                    })
+
+                    if result.is_error:
+                        response_text = f"Sorry, I couldn't retrieve your todos: {result.error_message}"
+                    elif result.result and result.result.data:
+                        todos = result.result.data
+                        if todos:
+                            response_text = f"You have {len(todos)} todos:\n"
+                            for i, todo in enumerate(todos[:5]):  # Show first 5
+                                status_icon = "✓" if todo['status'] == 'completed' else "○"
+                                response_text += f"{status_icon} {i+1}. {todo['title']}\n"
+                            if len(todos) > 5:
+                                response_text += f"\n... and {len(todos) - 5} more."
+                        else:
+                            response_text = "You don't have any todos right now."
+                    else:
+                        response_text = "Sorry, I couldn't retrieve your todos. The operation returned an unexpected response."
+                except Exception as e:
+                    response_text = f"Sorry, I encountered an error retrieving your todos: {str(e)}"
+                    needs_clarification = True
+
+            elif intent == 'complete_todo':
+                # Need to find the todo to complete
+                if 'todo_id' in entities:
+                    # Call the complete_todo MCP tool
+                    try:
+                        result = await mcp_server.handle_request({
+                            "tool_name": "complete_todo",
+                            "arguments": {
+                                "session_id": session_id,
+                                "todo_id": entities['todo_id']
+                            }
+                        })
+
+                        if result.is_error:
+                            response_text = f"Sorry, I couldn't complete that todo: {result.error_message}"
+                        elif result.result and result.result.data:
+                            todo_data = result.result.data
+                            response_text = f"I've marked '{todo_data['title']}' as completed!"
+                        else:
+                            response_text = "Sorry, I couldn't complete that todo. The operation returned an unexpected response."
+                    except Exception as e:
+                        response_text = f"Sorry, I encountered an error completing that todo: {str(e)}"
+                        needs_clarification = True
+                elif 'title_keyword' in entities:
+                    # Need to find todo by title keyword
+                    try:
+                        result = await mcp_server.handle_request({
+                            "tool_name": "list_todos",
+                            "arguments": {
+                                "session_id": session_id,
+                                "status": None  # Search all statuses, not just pending
+                            }
+                        })
+
+                        if result.is_error:
+                            response_text = f"Sorry, I couldn't find that todo: {result.error_message}"
+                        elif result.result and result.result.data:
+                            todos = result.result.data
+                            matching_todos = [t for t in todos if entities.get('title_keyword', '').lower() in t['title'].lower()]
+
+                            if len(matching_todos) == 1:
+                                # Complete the matching todo
+                                complete_result = await mcp_server.handle_request({
+                                    "tool_name": "complete_todo",
+                                    "arguments": {
+                                        "session_id": session_id,
+                                        "todo_id": matching_todos[0]['id']
+                                    }
+                                })
+
+                                if complete_result.is_error:
+                                    response_text = f"Sorry, I couldn't complete that todo: {complete_result.error_message}"
+                                elif complete_result.result and complete_result.result.data:
+                                    response_text = f"I've marked '{matching_todos[0]['title']}' as completed!"
+                                else:
+                                    response_text = "Sorry, I couldn't complete that todo. The operation returned an unexpected response."
+                            elif len(matching_todos) > 1:
+                                # Store the context for number selection
+                                options = []
+                                response_text = f"I found multiple todos matching '{entities.get('title_keyword', '')}'. Please respond with the number of your choice:\n"
+
+                                for i, todo in enumerate(matching_todos):
+                                    response_text += f"{i+1}. {todo['title']}\n"
+                                    options.append({
+                                        'id': todo['id'],
+                                        'title': todo['title']
+                                    })
+
+                                response_text += "\nFor example, respond with '1' or '2' to select the corresponding todo."
+
+                                # Store the context so we can handle the number response later
+                                context = ConversationContext(
+                                    session_id=session_id,
+                                    context_type=ContextType.NUMBER_SELECTION,
+                                    timestamp=datetime.now().isoformat(),
+                                    options=options,
+                                    original_request=user_input
+                                )
+                                context_manager.store_context(context)
+
+                                needs_clarification = True
+                            else:
+                                response_text = f"I couldn't find a todo matching '{entities.get('title_keyword', '')}'."
+                        else:
+                            response_text = "Sorry, I couldn't find that todo. The operation returned an unexpected response."
+                    except Exception as e:
+                        response_text = f"Sorry, I encountered an error finding that todo: {str(e)}"
+                        needs_clarification = True
+                else:
+                    response_text = "I need more information to identify which todo to complete."
+                    needs_clarification = True
+
+            elif intent == 'delete_todo':
+                # Need to find the todo to delete
+                if 'todo_id' in entities:
+                    # Call the delete_todo MCP tool
+                    try:
+                        result = await mcp_server.handle_request({
+                            "tool_name": "delete_todo",
+                            "arguments": {
+                                "session_id": session_id,
+                                "todo_id": entities['todo_id']
+                            }
+                        })
+
+                        if result.is_error:
+                            response_text = f"Sorry, I couldn't delete that todo: {result.error_message}"
+                        elif result.result:
+                            response_text = "I've deleted that todo for you."
+                        else:
+                            response_text = "Sorry, I couldn't delete that todo. The operation returned an unexpected response."
+                    except Exception as e:
+                        response_text = f"Sorry, I encountered an error deleting that todo: {str(e)}"
+                        needs_clarification = True
+                elif 'title_keyword' in entities:
+                    # Need to find todo by title keyword
+                    try:
+                        result = await mcp_server.handle_request({
+                            "tool_name": "list_todos",
+                            "arguments": {
+                                "session_id": session_id,
+                                "status": None  # Search all statuses, not just pending
+                            }
+                        })
+
+                        if result.is_error:
+                            response_text = f"Sorry, I couldn't find that todo: {result.error_message}"
+                        elif result.result and result.result.data:
+                            todos = result.result.data
+                            matching_todos = [t for t in todos if entities.get('title_keyword', '').lower() in t['title'].lower()]
+
+                            if len(matching_todos) == 1:
+                                # Delete the matching todo
+                                delete_result = await mcp_server.handle_request({
+                                    "tool_name": "delete_todo",
+                                    "arguments": {
+                                        "session_id": session_id,
+                                        "todo_id": matching_todos[0]['id']
+                                    }
+                                })
+
+                                if delete_result.is_error:
+                                    response_text = f"Sorry, I couldn't delete that todo: {delete_result.error_message}"
+                                elif delete_result.result:
+                                    response_text = f"I've deleted '{matching_todos[0]['title']}' for you!"
+                                else:
+                                    response_text = "Sorry, I couldn't delete that todo. The operation returned an unexpected response."
+                            elif len(matching_todos) > 1:
+                                # Store the context for number selection
+                                options = []
+                                response_text = f"I found multiple todos matching '{entities.get('title_keyword', '')}'. Please respond with the number of your choice:\n"
+
+                                for i, todo in enumerate(matching_todos):
+                                    response_text += f"{i+1}. {todo['title']}\n"
+                                    options.append({
+                                        'id': todo['id'],
+                                        'title': todo['title']
+                                    })
+
+                                response_text += "\nFor example, respond with '1' or '2' to select the corresponding todo."
+
+                                # Store the context so we can handle the number response later
+                                context = ConversationContext(
+                                    session_id=session_id,
+                                    context_type=ContextType.NUMBER_SELECTION,
+                                    timestamp=datetime.now().isoformat(),
+                                    options=options,
+                                    original_request=user_input
+                                )
+                                context_manager.store_context(context)
+
+                                needs_clarification = True
+                            else:
+                                response_text = f"I couldn't find a todo matching '{entities.get('title_keyword', '')}'."
+                        else:
+                            response_text = "Sorry, I couldn't find that todo. The operation returned an unexpected response."
+                    except Exception as e:
+                        response_text = f"Sorry, I encountered an error finding that todo: {str(e)}"
+                        needs_clarification = True
+                else:
+                    response_text = "I need more information to identify which todo to delete."
+                    needs_clarification = True
+
+            elif intent == 'number_selection':
+                # Handle number selections from previous clarification requests
+                number_selected = int(entities.get('number', 0))
+
+                if number_selected > 0:
+                    # Check if there's a context for this session
+                    context = context_manager.get_context(session_id)
+
+                    if context and context.context_type == ContextType.NUMBER_SELECTION:
+                        # Process the number selection based on the stored context
+                        if number_selected <= len(context.options):
+                            selected_option = context.options[number_selected - 1]
+
+                            # Perform the action based on the original request
+                            if context.original_request.startswith('edit'):
+                                # Handle edit action
+                                if 'title' in selected_option:
+                                    # Call the edit_todo MCP tool with the pre-calculated updated title
+                                    edit_result = await mcp_server.handle_request({
+                                        "tool_name": "edit_todo",
+                                        "arguments": {
+                                            "session_id": session_id,
+                                            "todo_id": selected_option['id'],
+                                            "title": selected_option['title']  # Use the updated title
+                                        }
+                                    })
+
+                                    if edit_result.is_error:
+                                        response_text = f"Sorry, I couldn't edit that todo: {edit_result.error_message}"
+                                    else:
+                                        response_text = f"I've updated '{selected_option['original_title']}' to '{selected_option['title']}'."
+                                else:
+                                    response_text = f"Please specify what you'd like to change about '{selected_option['title']}'. For example, 'update to [new value]'"
+                                    suggested_actions = [f"Update '{selected_option['title']}' to something else"]
+                                    needs_clarification = True
+
+                            elif context.original_request.startswith('delete'):
+                                # Handle delete action
+                                delete_result = await mcp_server.handle_request({
+                                    "tool_name": "delete_todo",
+                                    "arguments": {
+                                        "session_id": session_id,
+                                        "todo_id": selected_option['id']
+                                    }
+                                })
+
+                                if delete_result.is_error:
+                                    response_text = f"Sorry, I couldn't delete that todo: {delete_result.error_message}"
+                                else:
+                                    response_text = f"I've deleted '{selected_option['title']}' for you."
+
+                            elif context.original_request.startswith('complete'):
+                                # Handle complete action
+                                complete_result = await mcp_server.handle_request({
+                                    "tool_name": "complete_todo",
+                                    "arguments": {
+                                        "session_id": session_id,
+                                        "todo_id": selected_option['id']
+                                    }
+                                })
+
+                                if complete_result.is_error:
+                                    response_text = f"Sorry, I couldn't complete that todo: {complete_result.error_message}"
+                                else:
+                                    response_text = f"I've marked '{selected_option['title']}' as completed!"
+
+                            # Clear the context after processing
+                            context_manager.clear_context(session_id)
+                        else:
+                            response_text = f"Option {number_selected} is not valid. Please select a number between 1 and {len(context.options)}."
+                            needs_clarification = True
+                    else:
+                        # No context found, this could happen if session changed or context expired
+                        # Try to infer the action from the current input
+                        current_input_lower = user_input.lower().strip()
+
+                        # Check if this looks like a continuation of an edit operation
+                        if any(word in current_input_lower for word in ['edit', 'update', 'change', 'modify']):
+                            response_text = f"It seems you're trying to edit a todo, but I lost track of the previous context. Please repeat your edit command: 'edit [original text] to [new text]'"
+                        elif number_selected > 0:
+                            # User might be trying to select from a previous list that timed out
+                            response_text = f"I couldn't find the previous context for your selection. The options may have expired. Please repeat your original request to see the list again."
+                        else:
+                            response_text = f"I couldn't understand your selection. Please repeat your original request."
+                        needs_clarification = True
+                else:
+                    response_text = "I couldn't understand your selection. Please rephrase your request."
+                    needs_clarification = True
+
+            elif intent == 'edit_todo':
+                # Handle edit operations - need to find the todo to edit and extract what to edit
+                edit_details = entities.get('edit_details', '')
+
+                # Try to parse if user specified what to edit (e.g., "edit title of grocery shopping to buy fruits")
+                if ' to ' in edit_details.lower():
+                    # Split on 'to' to separate what to edit from the new value
+                    parts = edit_details.split(' to ', 1)  # Split only on the first occurrence
+                    target_part = parts[0].strip()
+                    new_value = parts[1].strip()
+
+                    # Find the target todo based on the first part
+                    # First, look for a todo that matches the target part
+                    try:
+                        result = await mcp_server.handle_request({
+                            "tool_name": "list_todos",
+                            "arguments": {
+                                "session_id": session_id,
+                                "status": None
+                            }
+                        })
+
+                        if result.is_error:
+                            response_text = f"Sorry, I couldn't find that todo: {result.error_message}"
+                        elif result.result and result.result.data:
+                            todos = result.result.data
+
+                            # Enhanced matching: look for todos that contain the target part
+                            # Also consider partial matches with word boundaries for better UX
+                            matching_todos = []
+                            for t in todos:
+                                title_lower = t['title'].lower()
+
+                                # Exact substring match
+                                if target_part.lower() in title_lower:
+                                    matching_todos.append(t)
+                                # Also check if target_part is a separate word in the title
+                                elif len(target_part.split()) == 1:  # if target is a single word
+                                    # Use word boundaries to match the word in the title
+                                    if re.search(r'\b' + re.escape(target_part.lower()) + r'\b', title_lower):
+                                        matching_todos.append(t)
+
+                            if len(matching_todos) == 1:
+                                # Found the target todo, now need to determine what field to update
+                                # For word replacement, replace target_part with new_value in the original title
+                                original_title = matching_todos[0]['title']
+                                # Replace the first occurrence of target_part with new_value
+                                # Using case-insensitive replacement
+                                updated_title = re.sub(
+                                    re.escape(target_part),
+                                    new_value,
+                                    original_title,
+                                    count=1,
+                                    flags=re.IGNORECASE
+                                )
+
+                                update_args = {
+                                    "session_id": session_id,
+                                    "todo_id": matching_todos[0]['id'],
+                                    "title": updated_title
+                                }
+
+                                edit_result = await mcp_server.handle_request({
+                                    "tool_name": "edit_todo",
+                                    "arguments": update_args
+                                })
+
+                                if edit_result.is_error:
+                                    response_text = f"Sorry, I couldn't edit that todo: {edit_result.error_message}"
+                                elif edit_result.result:
+                                    response_text = f"I've updated '{matching_todos[0]['title']}' to '{new_value}'."
+                                else:
+                                    response_text = "Sorry, I couldn't edit that todo. The operation returned an unexpected response."
+                            elif len(matching_todos) > 1:
+                                # Store the context for number selection
+                                options = []
+                                response_text = f"I found multiple todos matching '{target_part}'. Please respond with the number of your choice:\n"
+
+                                for i, todo in enumerate(matching_todos):
+                                    # Calculate the updated title for preview
+                                    updated_title = re.sub(
+                                        re.escape(target_part),
+                                        new_value,
+                                        todo['title'],
+                                        count=1,
+                                        flags=re.IGNORECASE
+                                    )
+                                    response_text += f"{i+1}. {todo['title']} → {updated_title}\n"
+                                    options.append({
+                                        'id': todo['id'],
+                                        'title': updated_title,  # Store the updated title
+                                        'original_title': todo['title'],
+                                        'new_value': new_value  # Store the new value for editing
+                                    })
+
+                                response_text += "\nFor example, respond with '1' or '2' to select the corresponding todo."
+
+                                # Store the context so we can handle the number response later
+                                context = ConversationContext(
+                                    session_id=session_id,
+                                    context_type=ContextType.NUMBER_SELECTION,
+                                    timestamp=datetime.now().isoformat(),
+                                    options=options,
+                                    original_request=user_input
+                                )
+                                context_manager.store_context(context)
+
+                                needs_clarification = True
+                            else:
+                                # No exact matches found, try a more lenient search
+                                # Look for todos that might contain similar terms
+                                similar_todos = []
+                                for t in todos:
+                                    title_lower = t['title'].lower()
+                                    target_words = target_part.lower().split()
+
+                                    # Count how many words from target_part appear in the title
+                                    matches = sum(1 for word in target_words if word in title_lower)
+                                    if matches > 0:
+                                        similar_todos.append((matches, t))
+
+                                # Sort by number of matches (descending)
+                                similar_todos.sort(key=lambda x: x[0], reverse=True)
+
+                                if similar_todos:
+                                    # Show the closest matches
+                                    top_matches = [todo for _, todo in similar_todos[:3]]  # Top 3 matches
+                                    response_text = f"I couldn't find an exact match for '{target_part}', but here are similar todos:\n"
+
+                                    options = []
+                                    for i, todo in enumerate(top_matches):
+                                        # Calculate the updated title for preview
+                                        updated_title = re.sub(
+                                            re.escape(target_part),
+                                            new_value,
+                                            todo['title'],
+                                            count=1,
+                                            flags=re.IGNORECASE
+                                        )
+                                        response_text += f"{i+1}. {todo['title']} → {updated_title}\n"
+                                        options.append({
+                                            'id': todo['id'],
+                                            'title': updated_title,  # Store the updated title
+                                            'original_title': todo['title'],
+                                            'new_value': new_value  # Store the new value for editing
+                                        })
+
+                                    response_text += f"\nDid you mean one of these? Respond with the number or clarify your request."
+
+                                    # Store the context so we can handle the number response later
+                                    context = ConversationContext(
+                                        session_id=session_id,
+                                        context_type=ContextType.NUMBER_SELECTION,
+                                        timestamp=datetime.now().isoformat(),
+                                        options=options,
+                                        original_request=user_input
+                                    )
+                                    context_manager.store_context(context)
+
+                                    needs_clarification = True
+                                else:
+                                    response_text = f"I couldn't find a todo matching '{target_part}'."
+                        else:
+                            response_text = "Sorry, I couldn't find that todo. The operation returned an unexpected response."
+                    except Exception as e:
+                        response_text = f"Sorry, I encountered an error finding that todo: {str(e)}"
+                        needs_clarification = True
+                else:
+                    # User just said "edit [todo title]" without specifying what to change
+                    # We'll ask for clarification
+                    response_text = f"What would you like to change about '{edit_details}'? Please specify what to update and the new value, like 'edit {edit_details} to [new value]'"
+                    suggested_actions = ["Specify what to update, e.g., 'edit grocery shopping to buy groceries today'"]
+                    needs_clarification = True
+
+            else:
+                # Unknown intent
+                response_text = f"I'm not sure what you mean by '{user_input}'. Could you rephrase that? I can help you add, view, edit, delete, or complete todos."
+                suggested_actions = [
+                    "Try saying 'Add buy groceries to my todos'",
+                    "Or 'Show me my pending todos'",
+                    "Or 'Complete task #1'"
+                ]
+                needs_clarification = True
+
+            # Prepare the final response
+            response = {
+                "intent": intent,
+                "entities": entities,
+                "response_text": response_text,
+                "suggested_actions": suggested_actions,
+                "needs_clarification": needs_clarification
+            }
+
+            logger.info(f"AI response generated", extra={"session_id": session_id, "intent": intent})
+            return response
+
+        except Exception as e:
+            logger.error(f"Error processing user input: {str(e)}", extra={"session_id": session_id})
+            return {
+                "intent": "error",
+                "entities": {},
+                "response_text": "Sorry, I encountered an error processing your request. Please try again.",
+                "suggested_actions": ["Try rephrasing your request"],
+                "needs_clarification": False
+            }
+
+    async def _process_with_openai_assistant(self, user_input: str, session_id: str) -> Dict[str, Any]:
+        """
+        Process user input using the OpenAI Assistant with MCP tools.
+        """
+        try:
+            # Create a thread for the conversation
+            thread = self.openai_client.beta.threads.create(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Session ID: {session_id}. User command: {user_input}"
+                    }
+                ]
+            )
+
+            # Run the assistant on the thread
+            run = self.openai_client.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=self.assistant.id
+            )
+
+            # Wait for the run to complete
+            import time
+            while run.status in ["queued", "in_progress", "requires_action"]:
+                time.sleep(0.5)
+                run = self.openai_client.beta.threads.runs.retrieve(
+                    thread_id=thread.id,
+                    run_id=run.id
+                )
+
+                # If the run requires action (tool calls), process them
+                if run.status == "requires_action":
+                    # Process tool calls
+                    tool_outputs = []
+
+                    for tool_call in run.required_action.submit_tool_outputs.tool_calls:
+                        tool_name = tool_call.function.name
+                        arguments = json.loads(tool_call.function.arguments)
+
+                        # Ensure session_id is included
+                        arguments["session_id"] = session_id
+
+                        # Call the appropriate MCP tool
+                        result = await mcp_server.handle_request({
+                            "tool_name": tool_name,
+                            "arguments": arguments
+                        })
+
+                        tool_outputs.append({
+                            "tool_call_id": tool_call.id,
+                            "output": json.dumps(result.result.data if result.result and result.result.data else str(result))
+                        })
+
+                    # Submit tool outputs
+                    run = self.openai_client.beta.threads.runs.submit_tool_outputs(
+                        thread_id=thread.id,
+                        run_id=run.id,
+                        tool_outputs=tool_outputs
+                    )
+
+            # Retrieve the messages from the thread
+            messages = self.openai_client.beta.threads.messages.list(thread_id=thread.id)
+
+            # Get the latest assistant message
+            assistant_message = None
+            for msg in reversed(messages.data):
+                if msg.role == "assistant":
+                    assistant_message = msg
+                    break
+
+            response_text = ""
+            if assistant_message:
+                response_text = " ".join(item.text.value for item in assistant_message.content if item.type == "text")
+            else:
+                response_text = "I processed your request but couldn't generate a response. Please try again."
+
+            return {
+                "intent": "processed_by_assistant",
+                "entities": {},
+                "response_text": response_text,
+                "suggested_actions": [],
+                "needs_clarification": False
+            }
+
+        except Exception as e:
+            logger.warning(f"Falling back to regex-based NLP due to assistant error: {str(e)}")
+            # Fall back to the original regex-based approach
+            return await self._process_with_fallback_nlp(user_input, session_id)
+
+    async def _process_with_fallback_nlp(self, user_input: str, session_id: str) -> Dict[str, Any]:
+        """
+        Process user input using the original regex-based NLP approach.
+        """
+        # Extract intent and entities
+        intent, entities = self._extract_intent_and_entities(user_input)
+
+        # Prepare arguments for MCP tool call
+        mcp_args = {"session_id": session_id}
+        mcp_args.update(entities)
+
+        response_text = ""
+        needs_clarification = False
+        suggested_actions = []
+
+        # Call the appropriate MCP tool based on intent
+        if intent == 'add_todo':
+            if 'title' in entities:
+                # Call the add_todo MCP tool
+                try:
+                    result = await mcp_server.handle_request({
+                        "tool_name": "add_todo",
+                        "arguments": {
+                            "session_id": session_id,
+                            "title": entities['title'],
+                            "priority": entities.get('priority'),
+                            "due_date": entities.get('due_date'),
+                            "category": entities.get('category')
+                        }
+                    })
+
+                    if result.is_error:
+                        response_text = f"Sorry, I couldn't add that todo: {result.error_message}"
+                    elif result.result and result.result.data:
+                        todo_data = result.result.data
+                        response_text = f"I've added '{todo_data['title']}' to your todos."
+                    else:
+                        response_text = "Sorry, I couldn't add that todo. The operation returned an unexpected response."
+                except Exception as e:
+                    response_text = f"Sorry, I encountered an error adding that todo: {str(e)}"
+                    needs_clarification = True
+            else:
+                response_text = "I need a title for the new todo. What would you like to add?"
+                needs_clarification = True
+
+        elif intent == 'view_todos':
+            # Call the list_todos MCP tool
+            try:
+                result = await mcp_server.handle_request({
+                    "tool_name": "list_todos",
+                    "arguments": {
+                        "session_id": session_id,
+                        "status": entities.get('status'),
+                        "category": entities.get('category'),
+                        "limit": 10  # Limit to 10 for readability
+                    }
+                })
+
+                if result.is_error:
+                    response_text = f"Sorry, I couldn't retrieve your todos: {result.error_message}"
+                elif result.result and result.result.data:
+                    todos = result.result.data
+                    if todos:
+                        response_text = f"You have {len(todos)} todos:\n"
+                        for i, todo in enumerate(todos[:5]):  # Show first 5
+                            status_icon = "✓" if todo['status'] == 'completed' else "○"
+                            response_text += f"{status_icon} {i+1}. {todo['title']}\n"
+                        if len(todos) > 5:
+                            response_text += f"\n... and {len(todos) - 5} more."
+                    else:
+                        response_text = "You don't have any todos right now."
+                else:
+                    response_text = "Sorry, I couldn't retrieve your todos. The operation returned an unexpected response."
+            except Exception as e:
+                response_text = f"Sorry, I encountered an error retrieving your todos: {str(e)}"
+                needs_clarification = True
+
+        elif intent == 'complete_todo':
+            # Need to find the todo to complete
+            if 'todo_id' in entities:
+                # Call the complete_todo MCP tool
+                try:
+                    result = await mcp_server.handle_request({
+                        "tool_name": "complete_todo",
+                        "arguments": {
+                            "session_id": session_id,
+                            "todo_id": entities['todo_id']
+                        }
+                    })
+
+                    if result.is_error:
+                        response_text = f"Sorry, I couldn't complete that todo: {result.error_message}"
+                    elif result.result and result.result.data:
+                        todo_data = result.result.data
+                        response_text = f"I've marked '{todo_data['title']}' as completed!"
+                    else:
+                        response_text = "Sorry, I couldn't complete that todo. The operation returned an unexpected response."
+                except Exception as e:
+                    response_text = f"Sorry, I encountered an error completing that todo: {str(e)}"
+                    needs_clarification = True
+            elif 'title_keyword' in entities:
+                # Need to find todo by title keyword
+                try:
+                    result = await mcp_server.handle_request({
+                        "tool_name": "list_todos",
+                        "arguments": {
+                            "session_id": session_id,
+                            "status": None  # Search all statuses, not just pending
+                        }
+                    })
+
+                    if result.is_error:
+                        response_text = f"Sorry, I couldn't find that todo: {result.error_message}"
+                    elif result.result and result.result.data:
+                        todos = result.result.data
+                        matching_todos = [t for t in todos if entities.get('title_keyword', '').lower() in t['title'].lower()]
+
+                        if len(matching_todos) == 1:
+                            # Complete the matching todo
+                            complete_result = await mcp_server.handle_request({
+                                "tool_name": "complete_todo",
+                                "arguments": {
+                                    "session_id": session_id,
+                                    "todo_id": matching_todos[0]['id']
+                                }
+                            })
+
+                            if complete_result.is_error:
+                                response_text = f"Sorry, I couldn't complete that todo: {complete_result.error_message}"
+                            elif complete_result.result and complete_result.result.data:
+                                response_text = f"I've marked '{matching_todos[0]['title']}' as completed!"
+                            else:
+                                response_text = "Sorry, I couldn't complete that todo. The operation returned an unexpected response."
+                        elif len(matching_todos) > 1:
+                            # Store the context for number selection
+                            options = []
+                            response_text = f"I found multiple todos matching '{entities.get('title_keyword', '')}'. Please respond with the number of your choice:\n"
+
+                            for i, todo in enumerate(matching_todos):
+                                response_text += f"{i+1}. {todo['title']}\n"
+                                options.append({
+                                    'id': todo['id'],
+                                    'title': todo['title']
+                                })
+
+                            response_text += "\nFor example, respond with '1' or '2' to select the corresponding todo."
+
+                            # Store the context so we can handle the number response later
+                            context = ConversationContext(
+                                session_id=session_id,
+                                context_type=ContextType.NUMBER_SELECTION,
+                                timestamp=datetime.now().isoformat(),
+                                options=options,
+                                original_request=user_input
+                            )
+                            context_manager.store_context(context)
+
+                            needs_clarification = True
+                        else:
+                            response_text = f"I couldn't find a todo matching '{entities.get('title_keyword', '')}'."
+                    else:
+                        response_text = "Sorry, I couldn't find that todo. The operation returned an unexpected response."
+                except Exception as e:
+                    response_text = f"Sorry, I encountered an error finding that todo: {str(e)}"
+                    needs_clarification = True
+            else:
+                response_text = "I need more information to identify which todo to complete."
+                needs_clarification = True
+
+        elif intent == 'delete_todo':
+            # Need to find the todo to delete
+            if 'todo_id' in entities:
+                # Call the delete_todo MCP tool
+                try:
+                    result = await mcp_server.handle_request({
+                        "tool_name": "delete_todo",
+                        "arguments": {
+                            "session_id": session_id,
+                            "todo_id": entities['todo_id']
+                        }
+                    })
+
+                    if result.is_error:
+                        response_text = f"Sorry, I couldn't delete that todo: {result.error_message}"
+                    elif result.result:
+                        response_text = "I've deleted that todo for you."
+                    else:
+                        response_text = "Sorry, I couldn't delete that todo. The operation returned an unexpected response."
+                except Exception as e:
+                    response_text = f"Sorry, I encountered an error deleting that todo: {str(e)}"
+                    needs_clarification = True
+            elif 'title_keyword' in entities:
+                # Need to find todo by title keyword
+                try:
+                    result = await mcp_server.handle_request({
+                        "tool_name": "list_todos",
+                        "arguments": {
+                            "session_id": session_id,
+                            "status": None  # Search all statuses, not just pending
+                        }
+                    })
+
+                    if result.is_error:
+                        response_text = f"Sorry, I couldn't find that todo: {result.error_message}"
+                    elif result.result and result.result.data:
+                        todos = result.result.data
+                        matching_todos = [t for t in todos if entities.get('title_keyword', '').lower() in t['title'].lower()]
+
+                        if len(matching_todos) == 1:
+                            # Delete the matching todo
+                            delete_result = await mcp_server.handle_request({
+                                "tool_name": "delete_todo",
+                                "arguments": {
+                                    "session_id": session_id,
+                                    "todo_id": matching_todos[0]['id']
+                                }
+                            })
+
+                            if delete_result.is_error:
+                                response_text = f"Sorry, I couldn't delete that todo: {delete_result.error_message}"
+                            elif delete_result.result:
+                                response_text = f"I've deleted '{matching_todos[0]['title']}' for you!"
+                            else:
+                                response_text = "Sorry, I couldn't delete that todo. The operation returned an unexpected response."
+                        elif len(matching_todos) > 1:
+                            # Store the context for number selection
+                            options = []
+                            response_text = f"I found multiple todos matching '{entities.get('title_keyword', '')}'. Please respond with the number of your choice:\n"
+
+                            for i, todo in enumerate(matching_todos):
+                                response_text += f"{i+1}. {todo['title']}\n"
+                                options.append({
+                                    'id': todo['id'],
+                                    'title': todo['title']
+                                })
+
+                            response_text += "\nFor example, respond with '1' or '2' to select the corresponding todo."
+
+                            # Store the context so we can handle the number response later
+                            context = ConversationContext(
+                                session_id=session_id,
+                                context_type=ContextType.NUMBER_SELECTION,
+                                timestamp=datetime.now().isoformat(),
+                                options=options,
+                                original_request=user_input
+                            )
+                            context_manager.store_context(context)
+
+                            needs_clarification = True
+                        else:
+                            response_text = f"I couldn't find a todo matching '{entities.get('title_keyword', '')}'."
+                    else:
+                        response_text = "Sorry, I couldn't find that todo. The operation returned an unexpected response."
+                except Exception as e:
+                    response_text = f"Sorry, I encountered an error finding that todo: {str(e)}"
+                    needs_clarification = True
+            else:
+                response_text = "I need more information to identify which todo to delete."
+                needs_clarification = True
+
+        elif intent == 'number_selection':
+            # Handle number selections from previous clarification requests
+            number_selected = int(entities.get('number', 0))
+
+            if number_selected > 0:
+                # Check if there's a context for this session
+                context = context_manager.get_context(session_id)
+
+                if context and context.context_type == ContextType.NUMBER_SELECTION:
+                    # Process the number selection based on the stored context
+                    if number_selected <= len(context.options):
+                        selected_option = context.options[number_selected - 1]
+
+                        # Perform the action based on the original request
+                        if context.original_request.startswith('edit'):
+                            # Handle edit action
+                            if 'title' in selected_option:
+                                # Call the edit_todo MCP tool with the pre-calculated updated title
+                                edit_result = await mcp_server.handle_request({
+                                    "tool_name": "edit_todo",
+                                    "arguments": {
+                                        "session_id": session_id,
+                                        "todo_id": selected_option['id'],
+                                        "title": selected_option['title']  # Use the updated title
+                                    }
+                                })
+
+                                if edit_result.is_error:
+                                    response_text = f"Sorry, I couldn't edit that todo: {edit_result.error_message}"
+                                else:
+                                    response_text = f"I've updated '{selected_option['original_title']}' to '{selected_option['title']}'."
+                            else:
+                                response_text = f"Please specify what you'd like to change about '{selected_option['title']}'. For example, 'update to [new value]'"
+                                suggested_actions = [f"Update '{selected_option['title']}' to something else"]
+                                needs_clarification = True
+
+                        elif context.original_request.startswith('delete'):
+                            # Handle delete action
+                            delete_result = await mcp_server.handle_request({
+                                "tool_name": "delete_todo",
+                                "arguments": {
+                                    "session_id": session_id,
+                                    "todo_id": selected_option['id']
+                                }
+                            })
+
+                            if delete_result.is_error:
+                                response_text = f"Sorry, I couldn't delete that todo: {delete_result.error_message}"
+                            else:
+                                response_text = f"I've deleted '{selected_option['title']}' for you."
+
+                        elif context.original_request.startswith('complete'):
+                            # Handle complete action
+                            complete_result = await mcp_server.handle_request({
+                                "tool_name": "complete_todo",
+                                "arguments": {
+                                    "session_id": session_id,
+                                    "todo_id": selected_option['id']
+                                }
+                            })
+
+                            if complete_result.is_error:
+                                response_text = f"Sorry, I couldn't complete that todo: {complete_result.error_message}"
+                            else:
+                                response_text = f"I've marked '{selected_option['title']}' as completed!"
+
+                        # Clear the context after processing
+                        context_manager.clear_context(session_id)
+                    else:
+                        response_text = f"Option {number_selected} is not valid. Please select a number between 1 and {len(context.options)}."
+                        needs_clarification = True
+                else:
+                    # No context found, this could happen if session changed or context expired
+                    # Try to infer the action from the current input
+                    current_input_lower = user_input.lower().strip()
+
+                    # Check if this looks like a continuation of an edit operation
+                    if any(word in current_input_lower for word in ['edit', 'update', 'change', 'modify']):
+                        response_text = f"It seems you're trying to edit a todo, but I lost track of the previous context. Please repeat your edit command: 'edit [original text] to [new text]'"
+                    elif number_selected > 0:
+                        # User might be trying to select from a previous list that timed out
+                        response_text = f"I couldn't find the previous context for your selection. The options may have expired. Please repeat your original request to see the list again."
+                    else:
+                        response_text = f"I couldn't understand your selection. Please repeat your original request."
+                    needs_clarification = True
+            else:
+                response_text = "I couldn't understand your selection. Please rephrase your request."
+                needs_clarification = True
+
+        elif intent == 'edit_todo':
+            # Handle edit operations - need to find the todo to edit and extract what to edit
+            edit_details = entities.get('edit_details', '')
+
+            # Try to parse if user specified what to edit (e.g., "edit title of grocery shopping to buy fruits")
+            if ' to ' in edit_details.lower():
+                # Split on 'to' to separate what to edit from the new value
+                parts = edit_details.split(' to ', 1)  # Split only on the first occurrence
+                target_part = parts[0].strip()
+                new_value = parts[1].strip()
+
+                # Find the target todo based on the first part
+                # First, look for a todo that matches the target part
+                try:
+                    result = await mcp_server.handle_request({
+                        "tool_name": "list_todos",
+                        "arguments": {
+                            "session_id": session_id,
+                            "status": None
+                        }
+                    })
+
+                    if result.is_error:
+                        response_text = f"Sorry, I couldn't find that todo: {result.error_message}"
+                    elif result.result and result.result.data:
+                        todos = result.result.data
+
+                        # Enhanced matching: look for todos that contain the target part
+                        # Also consider partial matches with word boundaries for better UX
+                        matching_todos = []
+                        for t in todos:
+                            title_lower = t['title'].lower()
+
+                            # Exact substring match
+                            if target_part.lower() in title_lower:
+                                matching_todos.append(t)
+                            # Also check if target_part is a separate word in the title
+                            elif len(target_part.split()) == 1:  # if target is a single word
+                                # Use word boundaries to match the word in the title
+                                if re.search(r'\b' + re.escape(target_part.lower()) + r'\b', title_lower):
+                                    matching_todos.append(t)
+
+                        if len(matching_todos) == 1:
+                            # Found the target todo, now need to determine what field to update
+                            # For word replacement, replace target_part with new_value in the original title
+                            original_title = matching_todos[0]['title']
+                            # Replace the first occurrence of target_part with new_value
+                            # Using case-insensitive replacement
+                            updated_title = re.sub(
+                                re.escape(target_part),
+                                new_value,
+                                original_title,
+                                count=1,
+                                flags=re.IGNORECASE
+                            )
+
+                            update_args = {
+                                "session_id": session_id,
+                                "todo_id": matching_todos[0]['id'],
+                                "title": updated_title
+                            }
+
+                            edit_result = await mcp_server.handle_request({
+                                "tool_name": "edit_todo",
+                                "arguments": update_args
+                            })
+
+                            if edit_result.is_error:
+                                response_text = f"Sorry, I couldn't edit that todo: {edit_result.error_message}"
+                            elif edit_result.result:
+                                response_text = f"I've updated '{matching_todos[0]['title']}' to '{new_value}'."
+                            else:
+                                response_text = "Sorry, I couldn't edit that todo. The operation returned an unexpected response."
+                        elif len(matching_todos) > 1:
+                            # Store the context for number selection
+                            options = []
+                            response_text = f"I found multiple todos matching '{target_part}'. Please respond with the number of your choice:\n"
+
+                            for i, todo in enumerate(matching_todos):
+                                # Calculate the updated title for preview
+                                updated_title = re.sub(
+                                    re.escape(target_part),
+                                    new_value,
+                                    todo['title'],
+                                    count=1,
+                                    flags=re.IGNORECASE
+                                )
+                                response_text += f"{i+1}. {todo['title']} → {updated_title}\n"
+                                options.append({
+                                    'id': todo['id'],
+                                    'title': updated_title,  # Store the updated title
+                                    'original_title': todo['title'],
+                                    'new_value': new_value  # Store the new value for editing
+                                })
+
+                            response_text += "\nFor example, respond with '1' or '2' to select the corresponding todo."
+
+                            # Store the context so we can handle the number response later
+                            context = ConversationContext(
+                                session_id=session_id,
+                                context_type=ContextType.NUMBER_SELECTION,
+                                timestamp=datetime.now().isoformat(),
+                                options=options,
+                                original_request=user_input
+                            )
+                            context_manager.store_context(context)
+
+                            needs_clarification = True
+                        else:
+                            # No exact matches found, try a more lenient search
+                            # Look for todos that might contain similar terms
+                            similar_todos = []
+                            for t in todos:
+                                title_lower = t['title'].lower()
+                                target_words = target_part.lower().split()
+
+                                # Count how many words from target_part appear in the title
+                                matches = sum(1 for word in target_words if word in title_lower)
+                                if matches > 0:
+                                    similar_todos.append((matches, t))
+
+                            # Sort by number of matches (descending)
+                            similar_todos.sort(key=lambda x: x[0], reverse=True)
+
+                            if similar_todos:
+                                # Show the closest matches
+                                top_matches = [todo for _, todo in similar_todos[:3]]  # Top 3 matches
+                                response_text = f"I couldn't find an exact match for '{target_part}', but here are similar todos:\n"
+
+                                options = []
+                                for i, todo in enumerate(top_matches):
+                                    # Calculate the updated title for preview
+                                    updated_title = re.sub(
+                                        re.escape(target_part),
+                                        new_value,
+                                        todo['title'],
+                                        count=1,
+                                        flags=re.IGNORECASE
+                                    )
+                                    response_text += f"{i+1}. {todo['title']} → {updated_title}\n"
+                                    options.append({
+                                        'id': todo['id'],
+                                        'title': updated_title,  # Store the updated title
+                                        'original_title': todo['title'],
+                                        'new_value': new_value  # Store the new value for editing
+                                    })
+
+                                response_text += f"\nDid you mean one of these? Respond with the number or clarify your request."
+
+                                # Store the context so we can handle the number response later
+                                context = ConversationContext(
+                                    session_id=session_id,
+                                    context_type=ContextType.NUMBER_SELECTION,
+                                    timestamp=datetime.now().isoformat(),
+                                    options=options,
+                                    original_request=user_input
+                                )
+                                context_manager.store_context(context)
+
+                                needs_clarification = True
+                            else:
+                                response_text = f"I couldn't find a todo matching '{target_part}'."
+                    else:
+                        response_text = "Sorry, I couldn't find that todo. The operation returned an unexpected response."
+                except Exception as e:
+                    response_text = f"Sorry, I encountered an error finding that todo: {str(e)}"
+                    needs_clarification = True
+            else:
+                # User just said "edit [todo title]" without specifying what to change
+                # We'll ask for clarification
+                response_text = f"What would you like to change about '{edit_details}'? Please specify what to update and the new value, like 'edit {edit_details} to [new value]'"
+                suggested_actions = ["Specify what to update, e.g., 'edit grocery shopping to buy groceries today'"]
+                needs_clarification = True
+
+        else:
+            # Unknown intent
+            response_text = f"I'm not sure what you mean by '{user_input}'. Could you rephrase that? I can help you add, view, edit, delete, or complete todos."
+            suggested_actions = [
+                "Try saying 'Add buy groceries to my todos'",
+                "Or 'Show me my pending todos'",
+                "Or 'Complete task #1'"
+            ]
+            needs_clarification = True
+
+        # Prepare the final response
+        response = {
+            "intent": intent,
+            "entities": entities,
+            "response_text": response_text,
+            "suggested_actions": suggested_actions,
+            "needs_clarification": needs_clarification
+        }
+
+        return response
+
+    def get_capabilities(self) -> Dict[str, Any]:
+        """
+        Get the AI processing capabilities.
+
+        Returns:
+            A dictionary describing what the AI can do
+        """
+        return {
+            "supported_intents": [
+                "add_todo",
+                "view_todos",
+                "update_todo",
+                "delete_todo",
+                "complete_todo",
+                "get_todo_stats"
+            ],
+            "entity_types": [
+                "todo_title",
+                "due_date",
+                "priority",
+                "category",
+                "todo_id"
+            ],
+            "max_tokens": 4096,
+            "response_format": "structured",
+            "supported_commands": [
+                "Add [todo] to my todos",
+                "Show me my [status] todos",
+                "Complete [todo]",
+                "Delete [todo]",
+                "Edit [todo details]"
+            ]
+        }
+
+
+# Global AI service instance
+ai_service = AIService()
