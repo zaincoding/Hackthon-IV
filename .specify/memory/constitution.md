@@ -1,55 +1,72 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+<!-- SYNC IMPACT REPORT
+Version change: N/A -> 1.0.0
+Added sections: Phase IV Deployment Principles, Allowed Tools Policy, Deployment Constraints
+Removed sections: None
+Modified principles: N/A (new constitution)
+Templates requiring updates:
+- .specify/templates/plan-template.md ✅ updated
+- .specify/templates/spec-template.md ✅ updated
+- .specify/templates/tasks-template.md ✅ updated
+- .specify/templates/commands/*.md ⚠ pending review
+Runtime docs: README.md ⚠ pending review
+Follow-up TODOs: None
+-->
+
+# Local Kubernetes Deployment Constitution
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. Phase IV Deployment Focus
+Containerization and local Kubernetes deployment must be achieved using AI-assisted tools only; No manual coding changes to Phase III app logic unless absolutely required for deployment; Maintain integrity of original Hackathon-2 Todo Chatbot codebase.
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+### II. AI-Assisted Tool Chain
+All containerization, image building, and deployment tasks must utilize AI-enabled tools: Docker AI Agent (Gordon) for Dockerfiles, kubectl-ai for Helm deployments, and Kagent for cluster optimization; Manual Dockerfile/Helm chart creation prohibited.
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+### III. Local-Only Deployment (NON-NEGOTIABLE)
+Deployment restricted to local Minikube environment only; No cloud or production deployment allowed; All infrastructure remains within local development environment; Zero-touch cloud deployment capabilities deliberately excluded.
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### IV. Containerization Requirements
+Frontend (Next.js) and Backend (FastAPI) applications must be containerized separately; Docker images must preserve original application environment variables and port configurations from Phase III; All dependencies must be properly encapsulated in containers.
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+### V. Configuration Preservation
+Environment variables, ports, and configuration settings from Phase III application must remain unchanged in deployment; Application logic and behavior must be identical post-deployment; No modifications to app-level business logic permitted.
 
-### [PRINCIPLE_6_NAME]
+### VI. AI Operations (AI-Ops) Integration
+Kubernetes orchestration must include AI-assisted scaling, debugging, and resource optimization capabilities; Deployment must support intelligent monitoring and self-healing; AI-generated logs and operational insights must be preserved for analysis.
 
+## Allowed Tools Policy
 
-[PRINCIPLE__DESCRIPTION]
+The following tools are authorized for Phase IV deployment activities:
+- Docker Desktop (version 4.53 or higher) for containerization
+- Docker AI Agent (Gordon) for automated Dockerfile generation and image building
+- kubectl-ai for Helm chart generation, deployment, scaling, and debugging
+- Kagent for cluster health analysis and optimization
+- Minikube for local Kubernetes cluster management
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+No other tools or manual intervention methods are permitted for core deployment tasks.
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+## Deployment Constraints
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+- Phase III Hackathon-2 Todo Chatbot code must remain unchanged unless required for Phase IV deployment
+- Deployment is strictly local-only using Minikube
+- Frontend and backend must be containerized separately (Next.js and FastAPI respectively)
+- All Docker images and Helm charts must be AI-generated with no manual editing
+- No CI/CD pipeline or cloud deployment required
+- Environment variables and ports must exactly match Phase III app specifications
+- AI-generated logs and operational data must be preserved for audit and analysis
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+## Scope of Work
+
+- Complete containerization of frontend and backend applications
+- AI-generated Helm chart creation and deployment
+- Kubernetes orchestration with proper service networking
+- AI Operations: automated scaling, debugging, and resource optimization
+- Local validation of frontend-backend communication
+- Node.js runtime environment preservation
+- Complete local development environment validation
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+This constitution governs all Phase IV deployment activities and supersedes any conflicting practices or procedures. All deployment tasks must comply with AI-assisted tool requirements and local-only constraints. Any deviation from these principles requires formal amendment documentation and approval. All Dockerfiles, Helm charts, and deployment configurations must be generated through AI tools without manual intervention. Code changes are prohibited except where necessary for deployment compatibility only.
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Version**: 1.0.0 | **Ratified**: 2026-01-28 | **Last Amended**: 2026-01-28

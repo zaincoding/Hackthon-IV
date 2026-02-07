@@ -185,7 +185,19 @@ class MCPServer:
             tool_func = self.tools[tool_name]
             result = tool_func(**arguments)
 
-            return MCPResponse(result=result)
+            # Check if the result is a TodoToolResult with errors
+            is_error = False
+            error_message = None
+
+            if hasattr(result, 'success') and not result.success:
+                is_error = True
+                error_message = result.error or result.message or "Tool operation failed"
+
+            return MCPResponse(
+                result=result,
+                is_error=is_error,
+                error_message=error_message
+            )
 
         except Exception as e:
             return MCPResponse(

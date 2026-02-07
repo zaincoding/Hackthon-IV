@@ -2,9 +2,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import time
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
+
 from src.config.settings import settings
 from src.services.monitoring_service import monitoring_service
 from src.utils.errors import handle_exception
+from src.models.database import create_tables
 
 
 def create_app() -> FastAPI:
@@ -15,6 +22,9 @@ def create_app() -> FastAPI:
         version=settings.APP_VERSION,
         debug=settings.DEBUG,
     )
+
+    # Create database tables on startup
+    create_tables()
 
     # Add CORS middleware
     app.add_middleware(
@@ -29,7 +39,9 @@ def create_app() -> FastAPI:
     from src.api.routes.todos import router as todos_router
     from src.api.routes.sessions import router as sessions_router
     from src.api.routes.ai import router as ai_router
+    from src.api.routes.auth import router as auth_router
 
+    app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(sessions_router, prefix="/api/v1/sessions", tags=["sessions"])
     app.include_router(todos_router, prefix="/api/v1/todos", tags=["todos"])
     app.include_router(ai_router, prefix="/api/v1/ai", tags=["ai"])

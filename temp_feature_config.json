@@ -1,0 +1,5 @@
+{
+  "featureDescription": "   Specify Phase IV deployment requirements\n\nProject: Phase IV Todo Chatbot\nObjective: Deploy the existing Phase III Hackathon-2 Todo Chatbot on local Kubernetes using Minikube, Helm, and AI-assisted DevOps.\n\nRequirements:\n- First, review the Phase III Hackathon-2 project:\n   - Confirm frontend & backend code structure\n   - Identify missing environment variables, configuration files, or dependencies required for local Kubernetes deployment\n   - Remove anything from Phase III not required for Phase IV\n- Containerization using Docker (via Gordon)\n- Helm charts for frontend/backend deployment\n- AI Ops via kubectl-ai and Kagent\n- NodePort exposure for frontend\n- Ensure backend APIs are accessible from frontend\n- Preserve Phase III app behavior exactly",
+  "number": 1,
+  "shortName": "local-kubernetes-deployment"
+}

@@ -1,3 +1,7 @@
+    //"postinstall": "node scripts/postinstall.js"
+
+
+
 # Claude Code Rules
 
 This file is generated during init for the selected agent.

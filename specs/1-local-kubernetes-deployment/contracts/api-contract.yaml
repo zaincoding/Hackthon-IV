@@ -1,0 +1,211 @@
+# API Contract: Todo Chatbot Backend Service
+
+## Overview
+This document defines the API contract for the backend service of the Todo Chatbot application. This is the existing API that needs to be accessible from the frontend service within the Kubernetes cluster.
+
+## Base URL
+The backend service will be accessible within the Kubernetes cluster at:
+- Internal service URL: `http://todo-backend.todo-app.svc.cluster.local:8000`
+- In-cluster address: `todo-backend:8000`
+
+## Health Check Endpoint
+### GET /health
+**Purpose**: Check the health status of the backend service
+
+**Response**:
+```json
+{
+  "status": "healthy",
+  "service": "todo-chatbot-backend",
+  "metrics": {
+    "response_time": 0.0,
+    "error_rate": 0,
+    "health_status": "unknown"
+  }
+}
+```
+
+## Session Management Endpoints
+### POST /api/v1/sessions/
+**Purpose**: Create a new user session
+
+**Request**:
+```json
+{}
+```
+
+**Response**:
+```json
+{
+  "session_id": "string",
+  "created_at": "timestamp"
+}
+```
+
+### GET /api/v1/sessions/{session_id}
+**Purpose**: Get session details
+
+**Response**:
+```json
+{
+  "session_id": "string",
+  "created_at": "timestamp",
+  "last_accessed": "timestamp"
+}
+```
+
+## Todo Management Endpoints
+### GET /api/v1/todos/
+**Purpose**: Retrieve all todos for a session
+
+**Query Parameters**:
+- `session_id` (required): The user session ID
+
+**Response**:
+```json
+[
+  {
+    "id": "string",
+    "title": "string",
+    "description": "string",
+    "due_date": "string",
+    "priority": "string",
+    "category": "string",
+    "status": "string",
+    "session_id": "string",
+    "created_at": "timestamp",
+    "updated_at": "timestamp"
+  }
+]
+```
+
+### POST /api/v1/todos/
+**Purpose**: Create a new todo
+
+**Request**:
+```json
+{
+  "session_id": "string",
+  "title": "string",
+  "description": "string",
+  "due_date": "string",
+  "priority": "string",
+  "category": "string"
+}
+```
+
+**Response**:
+```json
+{
+  "id": "string",
+  "title": "string",
+  "description": "string",
+  "due_date": "string",
+  "priority": "string",
+  "category": "string",
+  "status": "pending",
+  "session_id": "string",
+  "created_at": "timestamp",
+  "updated_at": "timestamp"
+}
+```
+
+### PUT /api/v1/todos/{todo_id}
+**Purpose**: Update an existing todo
+
+**Path Parameter**:
+- `todo_id` (required): The ID of the todo to update
+
+**Request**:
+```json
+{
+  "title": "string",
+  "description": "string",
+  "due_date": "string",
+  "priority": "string",
+  "category": "string",
+  "status": "string"
+}
+```
+
+**Response**:
+```json
+{
+  "id": "string",
+  "title": "string",
+  "description": "string",
+  "due_date": "string",
+  "priority": "string",
+  "category": "string",
+  "status": "string",
+  "session_id": "string",
+  "created_at": "timestamp",
+  "updated_at": "timestamp"
+}
+```
+
+### DELETE /api/v1/todos/{todo_id}
+**Purpose**: Delete a todo
+
+**Path Parameter**:
+- `todo_id` (required): The ID of the todo to delete
+
+**Response**:
+```json
+{
+  "success": true
+}
+```
+
+### PUT /api/v1/todos/{todo_id}/complete
+**Purpose**: Mark a todo as completed
+
+**Path Parameter**:
+- `todo_id` (required): The ID of the todo to complete
+
+**Response**:
+```json
+{
+  "id": "string",
+  "title": "string",
+  "description": "string",
+  "due_date": "string",
+  "priority": "string",
+  "category": "string",
+  "status": "completed",
+  "session_id": "string",
+  "created_at": "timestamp",
+  "updated_at": "timestamp"
+}
+```
+
+## AI Integration Endpoints
+### POST /api/v1/ai/chat
+**Purpose**: Process natural language input and manage todos
+
+**Request**:
+```json
+{
+  "session_id": "string",
+  "message": "string"
+}
+```
+
+**Response**:
+```json
+{
+  "response": "string",
+  "actions": [
+    {
+      "type": "create_todo|update_todo|delete_todo|complete_todo|get_todos",
+      "data": {}
+    }
+  ]
+}
+```
+
+## Service Discovery Requirements
+Within the Kubernetes cluster, the frontend service must be able to reach the backend service at:
+- `http://todo-backend:8000` (using Kubernetes internal DNS)
+
+The frontend will use this internal service address for API calls, and should pass this information in its configuration to connect to the backend.

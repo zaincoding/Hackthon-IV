@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview")
 
+    # Database settings
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./todo_app.db")  # Default to SQLite for backward compatibility
+
     # Session settings
     SESSION_TIMEOUT_HOURS: int = int(os.getenv("SESSION_TIMEOUT_HOURS", 24))
     MAX_TODOS_PER_SESSION: int = int(os.getenv("MAX_TODOS_PER_SESSION", 1000))
