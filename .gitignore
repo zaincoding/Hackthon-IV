@@ -62,22 +62,6 @@ out/
 .npm
 .yarn/
 
-# Kubernetes/Helm
-*.secret.yaml
-secrets/
-.kube/
-kubeconfig*
-*.key
-*.pem
-*.crt
-*.cert
-.helmignore
-charts/
-*.tgz
-
-# Minikube
-.minikube/
-*.iso
 
 # Temporary files
 *.tmp

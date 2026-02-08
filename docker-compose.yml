@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: postgres:15
@@ -31,9 +29,7 @@ services:
       - app-network
 
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: localkubernetesdeployment-backend:latest
     container_name: todo-backend
     ports:
       - "8000:8000"
@@ -51,14 +47,12 @@ services:
     command: sh -c "uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload"
 
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    image: localkubernetesdeployment-frontend:latest
     container_name: todo-frontend
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=http://backend:8000
       - NODE_ENV=development
     depends_on:
       - backend
@@ -82,6 +76,7 @@ networks:
 
 
 
+# version: '3.8'
 
 # services:
 #   db:
@@ -97,6 +92,11 @@ networks:
 #       - postgres_data:/var/lib/postgresql/data
 #     networks:
 #       - app-network
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -U postgres -d todo_app"]
+#       interval: 5s
+#       timeout: 5s
+#       retries: 5
 
 #   redis:
 #     image: redis:7-alpine
@@ -118,13 +118,15 @@ networks:
 #     environment:
 #       - ENVIRONMENT=docker
 #       - DATABASE_URL=postgresql://postgres:postgres@db:5432/todo_app
-
 #       - REDIS_URL=redis://redis:6379
 #     depends_on:
-#       - db
-#       - redis
+#       db:
+#         condition: service_healthy
+#       redis:
+#         condition: service_started
 #     networks:
 #       - app-network
+#     command: sh -c "uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload"
 
 #   frontend:
 #     build:
@@ -134,7 +136,7 @@ networks:
 #     ports:
 #       - "3000:3000"
 #     environment:
-#       - NEXT_PUBLIC_API_URL=http://backend:8000
+#       - NEXT_PUBLIC_API_URL=http://localhost:8000
 #       - NODE_ENV=development
 #     depends_on:
 #       - backend
@@ -149,3 +151,4 @@ networks:
 # networks:
 #   app-network:
 #     driver: bridge
+
