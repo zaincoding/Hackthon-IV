@@ -5,6 +5,19 @@ Thumbs.db
 *.swp
 *.swo
 
+
+# Environment variables
+# Ignore all .env files
+**/.env
+**/.env.*
+
+# But keep the example files
+!**/.env.example
+!**/.env.local.example
+
+
+
+
 # IDE
 .vscode/
 .idea/
